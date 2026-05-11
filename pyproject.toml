@@ -1,0 +1,62 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "arcboost"
+version = "0.1.0.dev0"
+description = "Gradient boosting with first-class circular feature splits (LightGBM v4.6.0 fork)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "ArcBoost contributors" }]
+keywords = ["gradient-boosting", "lightgbm", "circular", "directional", "machine-learning"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy",
+    "scipy",
+]
+
+[project.optional-dependencies]
+example = ["matplotlib", "pandas", "lightgbm>=4.6.0", "scikit-learn"]
+test = ["pytest", "lightgbm>=4.6.0", "scikit-learn"]
+
+[project.urls]
+Homepage = "https://github.com/sebaheg/ArcBoost"
+Issues = "https://github.com/sebaheg/ArcBoost/issues"
+
+# scikit-build-core points at the repo-root CMakeLists.txt, which:
+#   1. Invokes scripts/apply_patches.sh (idempotent) to apply patches to provider/lightgbm/
+#   2. add_subdirectory(provider/lightgbm) to build the patched _lightgbm extension
+# After patches apply, provider/lightgbm/python-package/arcboost/ exists (renamed from lightgbm/).
+[tool.scikit-build]
+cmake.version = ">=3.18"
+cmake.source-dir = "."
+build-dir = "build/{wheel_tag}"
+# Python sources live inside the patched submodule. Patch 0009 renames lightgbm/ -> arcboost/.
+# scikit-build-core resolves wheel.packages at build time (after CMake configure has applied patches).
+wheel.packages = ["provider/lightgbm/python-package/arcboost"]
+# CMakeLists.txt installs lib_lightgbm.{so,dylib,dll} to ${CMAKE_INSTALL_PREFIX}/lib.
+# Setting install-dir to "arcboost" anchors that prefix inside the package, so
+# the compiled library lands at arcboost/lib/lib_lightgbm.* — exactly where the
+# upstream libpath.py looks (Path(__file__).parents[0] / "lib" / "lib_lightgbm.*").
+wheel.install-dir = "arcboost"
+build.targets = ["_lightgbm"]
+# Don't ship the giant LightGBM source as data; only the compiled extension + Python wrapper.
+sdist.exclude = [
+    "provider/lightgbm/.git/",
+    "provider/lightgbm/docs/",
+    "provider/lightgbm/examples/",
+    "provider/lightgbm/R-package/",
+    "provider/lightgbm/swig/",
+    "provider/lightgbm/tests/",
+    "provider/lightgbm/windows/",
+    "build/",
+    "dist/",
+]

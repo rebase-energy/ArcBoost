@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:07:42 +0200
+Subject: [PATCH 01/13] ArcBoost: add CircularBin to BinType enum
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+First patch in the ArcBoost series. Adds the new bin-type tag without yet
+wiring up any logic that consumes it; subsequent patches add BinMapper
+support, the histogram split-finder, dispatch, config plumbing, and the
+Python API kwarg.
+
+The enum value is appended (CircularBin = 2) rather than inserted so that
+existing serialized datasets and saved models — which round-trip the
+numeric BinType through model.txt — remain readable.
+---
+ include/LightGBM/bin.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/include/LightGBM/bin.h b/include/LightGBM/bin.h
+index 5826f238..141f14ca 100644
+--- a/include/LightGBM/bin.h
++++ b/include/LightGBM/bin.h
+@@ -21,7 +21,12 @@ namespace LightGBM {
+ 
+ enum BinType {
+   NumericalBin,
+-  CategoricalBin
++  CategoricalBin,
++  // ArcBoost: features whose domain is a circle (e.g. wind direction, hour of day).
++  // Splits are arcs `[a, b] mod period` rather than linear thresholds. The bin
++  // index is computed by modular arithmetic in BinMapper::ValueToBin (no binary
++  // search), and split-finding scans cyclic prefix sums of (g, h) histograms.
++  CircularBin
+ };
+ 
+ enum MissingType {

@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:10:30 +0200
+Subject: [PATCH 05/13] ArcBoost: route CircularBin through
+ FindBestThresholdCircular
+
+Extends FeatureHistogram::ResetFunc() with a third dispatch branch so that
+features registered with bin_type == CircularBin call into the arc-search
+stub introduced by the previous patch. Numerical and categorical paths
+remain unchanged.
+
+The bound function is a single non-templated entry point because the stub
+implementation does not yet branch on the USE_RAND / USE_MC / USE_L1 /
+USE_MAX_OUTPUT / USE_SMOOTHING template flags. When the real algorithm
+lands, this dispatch should be expanded to a parallel template-instantiation
+tree mirroring FuncForCategorical{,L1,L2}.
+---
+ src/treelearner/feature_histogram.hpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/treelearner/feature_histogram.hpp b/src/treelearner/feature_histogram.hpp
+index 79a6061f..c3e8464b 100644
+--- a/src/treelearner/feature_histogram.hpp
++++ b/src/treelearner/feature_histogram.hpp
+@@ -78,6 +78,22 @@ class FeatureHistogram {
+   void ResetFunc() {
+     if (meta_->bin_type == BinType::NumericalBin) {
+       FuncForNumrical();
++    } else if (meta_->bin_type == BinType::CircularBin) {
++      // ArcBoost: bind the arc-search finder. Templated booleans (USE_RAND,
++      // USE_MC, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING) collapse here to a
++      // single non-templated entry point — the stub body in
++      // feature_histogram.cpp does not yet branch on those flags. When the
++      // real arc-search lands, swap this to a parallel template-instantiation
++      // tree mirroring FuncForCategorical / FuncForCategoricalL1 / L2.
++      using std::placeholders::_1;
++      using std::placeholders::_2;
++      using std::placeholders::_3;
++      using std::placeholders::_4;
++      using std::placeholders::_5;
++      using std::placeholders::_6;
++      find_best_threshold_fun_ =
++          std::bind(&FeatureHistogram::FindBestThresholdCircular, this,
++                    _1, _2, _3, _4, _5, _6);
+     } else {
+       FuncForCategorical();
+     }

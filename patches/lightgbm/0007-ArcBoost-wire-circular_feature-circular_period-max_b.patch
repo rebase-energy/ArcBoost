@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:11:59 +0200
+Subject: [PATCH 07/13] ArcBoost: wire
+ circular_feature/circular_period/max_bin_circular through config_auto
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+LightGBM's config_auto.cpp is a generated file that registers each Config
+field in five maps: aliases, the parameter_set, GetXxx parsers, the
+str_buf dumper, the alias-of map, and the type-of map. Adding new params
+requires editing all six locations.
+
+This patch threads the three new fields through config_auto.cpp so that
+they're parsed from the params dict, validated (max_bin_circular > 1),
+and round-tripped to the model file. Aliases match the categorical_feature
+naming pattern: arc_feature, circular_column, arc_column, circular_features.
+
+Per-feature period parsing (the name:wind_dir=360 syntax) is not yet
+implemented — for v0.1.0.dev0 every circular feature uses the global
+circular_period setting. Per-feature override is a follow-up.
+---
+ src/io/config_auto.cpp | 25 +++++++++++++++++++++++++
+ 1 file changed, 25 insertions(+)
+
+diff --git a/src/io/config_auto.cpp b/src/io/config_auto.cpp
+index e13cda83..96e5a20e 100644
+--- a/src/io/config_auto.cpp
++++ b/src/io/config_auto.cpp
+@@ -139,6 +139,11 @@ const std::unordered_map<std::string, std::string>& Config::alias_table() {
+   {"categorical_column", "categorical_feature"},
+   {"cat_column", "categorical_feature"},
+   {"categorical_features", "categorical_feature"},
++  // ArcBoost: circular_feature aliases
++  {"arc_feature", "circular_feature"},
++  {"circular_column", "circular_feature"},
++  {"arc_column", "circular_feature"},
++  {"circular_features", "circular_feature"},
+   {"is_save_binary", "save_binary"},
+   {"is_save_binary_file", "save_binary"},
+   {"is_predict_raw_score", "predict_raw_score"},
+@@ -276,6 +281,9 @@ const std::unordered_set<std::string>& Config::parameter_set() {
+   "group_column",
+   "ignore_column",
+   "categorical_feature",
++  "circular_feature",
++  "circular_period",
++  "max_bin_circular",
+   "forcedbins_filename",
+   "save_binary",
+   "precise_float_parser",
+@@ -556,6 +564,14 @@ void Config::GetMembersFromString(const std::unordered_map<std::string, std::str
+ 
+   GetString(params, "categorical_feature", &categorical_feature);
+ 
++  // ArcBoost: circular feature plumbing
++  GetString(params, "circular_feature", &circular_feature);
++
++  GetDouble(params, "circular_period", &circular_period);
++
++  GetInt(params, "max_bin_circular", &max_bin_circular);
++  CHECK_GT(max_bin_circular, 1);
++
+   GetString(params, "forcedbins_filename", &forcedbins_filename);
+ 
+   GetBool(params, "save_binary", &save_binary);
+@@ -756,6 +772,9 @@ std::string Config::SaveMembersToString() const {
+   str_buf << "[group_column: " << group_column << "]\n";
+   str_buf << "[ignore_column: " << ignore_column << "]\n";
+   str_buf << "[categorical_feature: " << categorical_feature << "]\n";
++  str_buf << "[circular_feature: " << circular_feature << "]\n";
++  str_buf << "[circular_period: " << circular_period << "]\n";
++  str_buf << "[max_bin_circular: " << max_bin_circular << "]\n";
+   str_buf << "[forcedbins_filename: " << forcedbins_filename << "]\n";
+   str_buf << "[precise_float_parser: " << precise_float_parser << "]\n";
+   str_buf << "[parser_config_file: " << parser_config_file << "]\n";
+@@ -885,6 +904,9 @@ const std::unordered_map<std::string, std::vector<std::string>>& Config::paramet
+     {"group_column", {"group", "group_id", "query_column", "query", "query_id"}},
+     {"ignore_column", {"ignore_feature", "blacklist"}},
+     {"categorical_feature", {"cat_feature", "categorical_column", "cat_column", "categorical_features"}},
++    {"circular_feature", {"arc_feature", "circular_column", "arc_column", "circular_features"}},
++    {"circular_period", {}},
++    {"max_bin_circular", {}},
+     {"forcedbins_filename", {}},
+     {"save_binary", {"is_save_binary", "is_save_binary_file"}},
+     {"precise_float_parser", {}},
+@@ -1030,6 +1052,9 @@ const std::unordered_map<std::string, std::string>& Config::ParameterTypes() {
+     {"group_column", "string"},
+     {"ignore_column", "vector<int>"},
+     {"categorical_feature", "vector<int>"},
++    {"circular_feature", "vector<int>"},
++    {"circular_period", "double"},
++    {"max_bin_circular", "int"},
+     {"forcedbins_filename", "string"},
+     {"save_binary", "bool"},
+     {"precise_float_parser", "bool"},

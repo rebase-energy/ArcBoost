@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:08:27 +0200
+Subject: [PATCH 02/13] ArcBoost: BinMapper circular_period_ field + ValueToBin
+ branch
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the period field needed to interpret a circular feature's domain (in
+radians, degrees, hours, etc.) plus an O(1) modular bin-index computation
+in ValueToBin for CircularBin features. No binary search is needed — the
+arc-bin grid is uniform on [0, period).
+
+NaN handling mirrors the numeric convention: when missing_type_ == NaN,
+the last bin (num_bin_ - 1) is reserved for NaN values and arc-search
+treats it as out of the cyclic ring.
+
+InitAsCircular() is declared as a forward-looking factory helper; its body
+is supplied by a follow-up patch that lives in src/io/bin.cpp. Same goes
+for the serialization round-trip (Save/Load) extensions that need to write
+circular_period_ to model.txt — kept out of this patch to keep the diff
+focused on the ValueToBin hot path.
+---
+ include/LightGBM/bin.h | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/include/LightGBM/bin.h b/include/LightGBM/bin.h
+index 141f14ca..59c907c4 100644
+--- a/include/LightGBM/bin.h
++++ b/include/LightGBM/bin.h
+@@ -261,6 +261,24 @@ class BinMapper {
+   uint32_t default_bin_;
+ 
+   uint32_t most_freq_bin_;
++
++  // ---- ArcBoost circular feature support -----------------------------------
++  // Period of the circular feature (e.g. 2*pi for radians, 360 for degrees,
++  // 24 for hour-of-day, 365.25 for day-of-year). Only meaningful when
++  // bin_type_ == BinType::CircularBin. Default sentinel value 0.0 means
++  // "not a circular feature"; constructors that set CircularBin must override.
++  double circular_period_ = 0.0;
++
++ public:
++  inline double circular_period() const { return circular_period_; }
++  inline void set_circular_period(double p) { circular_period_ = p; }
++
++  // ArcBoost: factory-style helper that initializes a BinMapper as a circular
++  // feature with `num_bin` equally-spaced arc-bins covering [0, period).
++  // Implementation lives in src/io/bin.cpp (added by a follow-up patch); this
++  // declaration reserves the API surface so other patches can reference it.
++  void InitAsCircular(int num_bin, double period, MissingType missing_type);
++  // --------------------------------------------------------------------------
+ };
+ 
+ /*! \brief Iterator for one bin column */
+@@ -618,12 +636,35 @@ inline uint32_t BinMapper::ValueToBin(double value) const {
+   if (std::isnan(value)) {
+     if (bin_type_ == BinType::CategoricalBin) {
+       return 0;
++    } else if (bin_type_ == BinType::CircularBin) {
++      // ArcBoost: NaN routed to the last bin when missing_type_ == NaN, mirroring
++      // the numeric convention. Otherwise treat as 0.0 phase.
++      if (missing_type_ == MissingType::NaN) {
++        return num_bin_ - 1;
++      }
++      value = 0.0;
+     } else if (missing_type_ == MissingType::NaN) {
+       return num_bin_ - 1;
+     } else {
+       value = 0.0f;
+     }
+   }
++  if (bin_type_ == BinType::CircularBin) {
++    // ArcBoost: O(1) modular bin index. The arc-bin grid is uniform on
++    // [0, circular_period_) with `num_bin_` bins (or num_bin_ - 1 real bins
++    // plus one NaN bin when missing_type_ == NaN). The fmod() handles values
++    // outside [0, period); the second adjustment handles negative remainders.
++    int real_bins = (missing_type_ == MissingType::NaN) ? (num_bin_ - 1) : num_bin_;
++    if (real_bins <= 0 || circular_period_ <= 0.0) {
++      return 0;
++    }
++    double r = std::fmod(value, circular_period_);
++    if (r < 0.0) r += circular_period_;
++    int b = static_cast<int>(std::floor(r / circular_period_ * real_bins));
++    if (b < 0) b = 0;
++    if (b >= real_bins) b = real_bins - 1;
++    return static_cast<uint32_t>(b);
++  }
+   if (bin_type_ == BinType::NumericalBin) {
+     // binary search to find bin
+     int l = 0;

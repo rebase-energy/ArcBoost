@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:15:11 +0200
+Subject: [PATCH 10/13] ArcBoost: reject circular_feature on GPU/CUDA device
+ types
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The GPU and CUDA tree learners maintain their own histogram and split-finding
+kernels that haven't been extended for arc-search. Rather than silently
+producing inconsistent splits or crashing inside the device kernel, validate
+at config-load time and Log::Fatal with a message that points at the right
+fix (use device_type='cpu' or drop circular_feature).
+
+The CLI binary build is already auto-disabled in v4.6.0 when __BUILD_FOR_PYTHON
+is set (CMakeLists.txt lines 62-64), so the 'strip CLI' goal from the plan
+needs no additional patch. The R-package directory is independent of the
+main CMake target and ships separately upstream — also nothing to do.
+
+This rounds out the v0 patch series at 10 commits ready for git format-patch.
+---
+ src/io/config.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/io/config.cpp b/src/io/config.cpp
+index 3f8e85d1..a1cb0866 100644
+--- a/src/io/config.cpp
++++ b/src/io/config.cpp
+@@ -415,6 +415,19 @@ void Config::CheckParamConflict(const std::unordered_map<std::string, std::strin
+       Log::Warning("Although \"deterministic\" is set, the results ran by GPU may be non-deterministic.");
+     }
+   }
++  // ArcBoost: circular features require the CPU SerialTreeLearner path. The
++  // GPU and CUDA tree learners have their own histogram/split-finder kernels
++  // that haven't been extended for arc-search. Reject early with a clear
++  // message rather than silently producing wrong splits or crashing inside
++  // the device kernels.
++  if (!circular_feature.empty()
++      && (device_type == std::string("gpu") || device_type == std::string("cuda"))) {
++    Log::Fatal(
++        "ArcBoost: circular_feature is not supported on device_type='%s' in "
++        "v0.1.0.dev0. Set device_type='cpu' (default) or remove circular_feature "
++        "to use the GPU/CUDA path with categorical/numerical handling.",
++        device_type.c_str());
++  }
+   // linear tree learner must be serial type and run on CPU device
+   if (linear_tree) {
+     if (device_type != std::string("cpu") && device_type != std::string("gpu")) {

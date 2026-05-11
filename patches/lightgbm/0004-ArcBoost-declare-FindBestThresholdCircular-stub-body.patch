@@ -1,0 +1,117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:10:07 +0200
+Subject: [PATCH 04/13] ArcBoost: declare FindBestThresholdCircular (stub body)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds the arc-search split-finder API surface and embeds the full algorithm
+spec (cyclic prefix sums, O(B^2) arc scan, bitset emission) in the header
+comment block. The implementation is a Log::Fatal stub for v0.1.0.dev0 so
+that the patch series compiles and links cleanly while leaving the real
+algorithm as a clearly-scoped follow-up commit.
+
+Choice rationale: a stub that errors loudly is preferable to silently
+falling back to numerical splits — users who pass circular_feature[] expect
+arc semantics, and a fallback would mask the missing implementation while
+producing technically-valid but wrong-shaped trees.
+---
+ src/treelearner/feature_histogram.cpp | 28 ++++++++++++++++
+ src/treelearner/feature_histogram.hpp | 46 +++++++++++++++++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/src/treelearner/feature_histogram.cpp b/src/treelearner/feature_histogram.cpp
+index 29d99b92..6d03d08d 100644
+--- a/src/treelearner/feature_histogram.cpp
++++ b/src/treelearner/feature_histogram.cpp
+@@ -736,4 +736,32 @@ void FeatureHistogram::FindBestThresholdCategoricalIntInner(int64_t int_sum_grad
+   }
+ }
+ 
++// ArcBoost: arc-membership split-finder stub.
++//
++// Status: declared but not yet implemented. The full O(B^2) cyclic-prefix-sum
++// arc-search is described in the comment block on the declaration in
++// feature_histogram.hpp. Until that lands, dispatch routes to this stub which
++// errors with a clear message. With this stub in place, the build links and
++// the rest of the patch series (config, dispatch, Python API) can be tested
++// against non-circular workloads.
++//
++// To implement: model on FindBestThresholdCategoricalInner above. Reuse
++// GetSplitGains<USE_MC, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>() for gain
++// computation, and emit the chosen arc as a bitset in output->cat_threshold
++// so the existing categorical decode path in Tree::Decide handles it.
++void FeatureHistogram::FindBestThresholdCircular(double /*sum_gradient*/,
++                                                 double /*sum_hessian*/,
++                                                 data_size_t /*num_data*/,
++                                                 const FeatureConstraint* /*constraints*/,
++                                                 double /*parent_output*/,
++                                                 SplitInfo* output) {
++  output->gain = kMinScore;
++  is_splittable_ = false;
++  Log::Fatal(
++      "ArcBoost: circular split-finder is declared but not yet implemented "
++      "(v0.1.0.dev0). Remove the `circular_feature` parameter to fall back "
++      "to LightGBM's default numerical/categorical handling, or contribute "
++      "the implementation per the algorithm spec in feature_histogram.hpp.");
++}
++
+ }  // namespace LightGBM
+diff --git a/src/treelearner/feature_histogram.hpp b/src/treelearner/feature_histogram.hpp
+index 2d4abbd2..79a6061f 100644
+--- a/src/treelearner/feature_histogram.hpp
++++ b/src/treelearner/feature_histogram.hpp
+@@ -471,6 +471,52 @@ class FeatureHistogram {
+                                             double parent_output,
+                                             SplitInfo* output);
+ 
++  // ArcBoost: arc-membership split-finder for circular features.
++  //
++  // Algorithm (to be implemented):
++  //   Let B = meta_->num_bin, and let g[b], h[b] be the histogram entries
++  //   (sum_gradient, sum_hessian) for bin b in [0, B).
++  //
++  //   1. Build doubled cyclic prefix sums:
++  //        G_pref[0] = 0, G_pref[i+1] = G_pref[i] + g[i mod B]   for i in [0, 2B)
++  //        H_pref[0] = 0, H_pref[i+1] = H_pref[i] + h[i mod B]
++  //      The doubling lets us read any contiguous arc as a flat slice instead
++  //      of fmod-indexing in the inner loop.
++  //
++  //   2. Scan all (start, length) pairs:
++  //        for start in [0, B):
++  //          for length in [1, B/2 + 1):    # complement arcs are equivalent
++  //            G_in  = G_pref[start+length] - G_pref[start]
++  //            H_in  = H_pref[start+length] - H_pref[start]
++  //            G_out = sum_gradient - G_in
++  //            H_out = sum_hessian  - H_in
++  //            count_in = round(H_in * cnt_factor)
++  //            apply min_data_in_leaf / min_sum_hessian_in_leaf checks
++  //            gain = GetSplitGains<USE_MC, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>(
++  //                       G_out, H_out, G_in, H_in, lambda_l1, lambda_l2,
++  //                       max_delta_step, constraints, ..., parent_output)
++  //            track best (start, length, gain).
++  //
++  //   3. Materialize the chosen arc as a bit-set into output->cat_threshold
++  //      (reusing the categorical bitset machinery — an arc on B bins is a
++  //      contiguous bit-run with mod-B wraparound, which fits the same
++  //      Common::FindInBitset() decode path).
++  //
++  //   4. Set output->left_count / right_count, default_left, the threshold
++  //      bookkeeping fields, and is_splittable_, mirroring the categorical
++  //      finder's output contract.
++  //
++  // Complexity: O(B^2) per node per circular feature. With B = 64 (default
++  // max_bin_circular), that's ~2k gain evaluations after the length<=B/2 prune
++  // — comparable to existing categorical Fisher-search on high-cardinality
++  // features and dominated by histogram construction in practice.
++  void FindBestThresholdCircular(double sum_gradient,
++                                 double sum_hessian,
++                                 data_size_t num_data,
++                                 const FeatureConstraint* constraints,
++                                 double parent_output,
++                                 SplitInfo* output);
++
+   void GatherInfoForThreshold(double sum_gradient, double sum_hessian,
+                               uint32_t threshold, data_size_t num_data,
+                               double parent_output, SplitInfo* output) {

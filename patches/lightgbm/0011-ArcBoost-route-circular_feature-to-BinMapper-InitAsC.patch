@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:43:44 +0200
+Subject: [PATCH 11/13] ArcBoost: route circular_feature to
+ BinMapper::InitAsCircular at Dataset construction
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the gap between 'config.circular_feature is parsed' and 'features
+listed in circular_feature actually get BinType::CircularBin'.
+
+Adds:
+  - DatasetLoader::circular_features_ set, populated from config_.circular_feature
+    using the same name:/index syntax as categorical_feature (with a clear
+    fatal if a feature is listed in both).
+  - In ConstructFromSampleData and ConstructFromMultipleData, branch on
+    circular_features_ alongside categorical_features_ to set bin_type =
+    BinType::CircularBin and route through BinMapper::InitAsCircular()
+    instead of FindBin().
+  - BinMapper::InitAsCircular(num_bin, period, missing_type) implementation
+    in src/io/bin.cpp — sets bin_type_, num_bin_, circular_period_,
+    missing_type_, default_bin_, most_freq_bin_, is_trivial_, min_val_,
+    max_val_, and clears the categorical / numeric-specific bookkeeping.
+
+After this patch, 'circular_feature="0"' in the params dict actually marks
+column 0 as circular and the dispatch in feature_histogram.hpp routes it to
+FindBestThresholdCircular (still a stub until the algorithmic patch lands).
+---
+ include/LightGBM/dataset_loader.h |  2 ++
+ src/io/bin.cpp                    | 45 +++++++++++++++++++++++++
+ src/io/dataset_loader.cpp         | 55 +++++++++++++++++++++++++++++--
+ 3 files changed, 100 insertions(+), 2 deletions(-)
+
+diff --git a/include/LightGBM/dataset_loader.h b/include/LightGBM/dataset_loader.h
+index 73b8e7bf..32820717 100644
+--- a/include/LightGBM/dataset_loader.h
++++ b/include/LightGBM/dataset_loader.h
+@@ -101,6 +101,8 @@ class DatasetLoader {
+   std::vector<std::string> feature_names_;
+   /*! \brief Mapper from real feature index to used index*/
+   std::unordered_set<int> categorical_features_;
++  /*! \brief ArcBoost: feature indices flagged as circular by config_.circular_feature */
++  std::unordered_set<int> circular_features_;
+   /*! \brief Whether to store raw feature values */
+   bool store_raw_;
+ };
+diff --git a/src/io/bin.cpp b/src/io/bin.cpp
+index 3d84599e..d77765fb 100644
+--- a/src/io/bin.cpp
++++ b/src/io/bin.cpp
+@@ -1069,4 +1069,49 @@ namespace LightGBM {
+ 
+   #endif  // USE_CUDA
+ 
++// ArcBoost: initialize a BinMapper as a circular feature.
++//
++// The arc-bin grid is uniform on [0, period) with `num_bin` bins (or
++// `num_bin - 1` real bins plus one NaN bin when missing_type == NaN). No
++// sample data is needed — the binning is purely a function of the period
++// and bin count, so we skip the FindBin sample-based machinery entirely.
++//
++// Fields populated:
++//   - bin_type_         = BinType::CircularBin
++//   - num_bin_          = num_bin
++//   - missing_type_     = caller-provided
++//   - circular_period_  = period (used by ValueToBin)
++//   - default_bin_      = ValueToBin(0.0)
++//   - most_freq_bin_    = default_bin_
++//   - is_trivial_       = (num_bin <= 1)
++//   - min_val_ / max_val_ = 0 / period (for serialization parity with numeric)
++//   - bin_upper_bound_  = empty (circular uses modular indexing, no thresholds)
++//   - categorical_2_bin_ / bin_2_categorical_ = empty
++//   - sparse_rate_      = 0 (no sample data to compute it from)
++void BinMapper::InitAsCircular(int num_bin, double period, MissingType missing_type) {
++  if (period <= 0.0) {
++    Log::Fatal("InitAsCircular: circular_period must be > 0, got %.6g", period);
++  }
++  if (num_bin <= 1) {
++    Log::Fatal("InitAsCircular: num_bin must be > 1 (got %d) — a single-bin "
++               "circular feature carries no information", num_bin);
++  }
++  bin_type_ = BinType::CircularBin;
++  num_bin_ = num_bin;
++  missing_type_ = missing_type;
++  circular_period_ = period;
++  is_trivial_ = false;
++  sparse_rate_ = 0.0;
++  min_val_ = 0.0;
++  max_val_ = period;
++  bin_upper_bound_.clear();
++  categorical_2_bin_.clear();
++  bin_2_categorical_.clear();
++  // Now that all fields driving ValueToBin are set, compute default_bin_ and
++  // most_freq_bin_. For a uniform circular distribution, the choice doesn't
++  // matter for correctness — pick the bin containing 0.0.
++  default_bin_ = ValueToBin(0.0);
++  most_freq_bin_ = default_bin_;
++}
++
+ }  // namespace LightGBM
+diff --git a/src/io/dataset_loader.cpp b/src/io/dataset_loader.cpp
+index 9c8a0417..a8d40608 100644
+--- a/src/io/dataset_loader.cpp
++++ b/src/io/dataset_loader.cpp
+@@ -188,6 +188,40 @@ void DatasetLoader::SetHeader(const char* filename) {
+       }
+     }
+   }
++  // ArcBoost: parse config_.circular_feature with the same name:/index syntax
++  // as categorical_feature. The set populated here is consumed in
++  // ConstructFromSampleData / ConstructFromMultipleData (this file) where
++  // BinMappers are instantiated — features in this set get InitAsCircular()
++  // instead of FindBin() and end up with bin_type_ == BinType::CircularBin.
++  if (config_.circular_feature.size() > 0) {
++    if (Common::StartsWith(config_.circular_feature, name_prefix)) {
++      std::string names = config_.circular_feature.substr(name_prefix.size());
++      for (auto name : Common::Split(names.c_str(), ',')) {
++        if (name2idx.count(name) > 0) {
++          int tmp = name2idx[name];
++          circular_features_.emplace(tmp);
++        } else {
++          Log::Fatal("Could not find circular_feature %s in data", name.c_str());
++        }
++      }
++    } else {
++      for (auto token : Common::Split(config_.circular_feature.c_str(), ',')) {
++        int tmp = 0;
++        if (!Common::AtoiAndCheck(token.c_str(), &tmp)) {
++          Log::Fatal("circular_feature is not a number,\n"
++                     "if you want to use a column name,\n"
++                     "please add the prefix \"name:\" to the column name");
++        }
++        circular_features_.emplace(tmp);
++      }
++    }
++  }
++  // ArcBoost: validate that no feature is both circular and categorical.
++  for (int idx : circular_features_) {
++    if (categorical_features_.count(idx) > 0) {
++      Log::Fatal("Feature %d cannot be both categorical_feature and circular_feature.", idx);
++    }
++  }
+ }
+ 
+ void CheckSampleSize(size_t sample_cnt, size_t num_data) {
+@@ -639,9 +673,20 @@ Dataset* DatasetLoader::ConstructFromSampleData(double** sample_values,
+         if (!feat_is_unconstrained) {
+             Log::Fatal("The output cannot be monotone with respect to categorical features");
+         }
++      } else if (circular_features_.count(i)) {
++        // ArcBoost: circular feature — bin grid is uniform on [0, period),
++        // skip the FindBin sample-based binning entirely.
++        bin_type = BinType::CircularBin;
++        bool feat_is_unconstrained = ((config_.monotone_constraints.size() == 0) || (config_.monotone_constraints[i] == 0));
++        if (!feat_is_unconstrained) {
++          Log::Fatal("The output cannot be monotone with respect to circular features");
++        }
+       }
+       bin_mappers[i].reset(new BinMapper());
+-      if (config_.max_bin_by_feature.empty()) {
++      if (bin_type == BinType::CircularBin) {
++        MissingType mt = config_.use_missing ? MissingType::NaN : MissingType::None;
++        bin_mappers[i]->InitAsCircular(config_.max_bin_circular, config_.circular_period, mt);
++      } else if (config_.max_bin_by_feature.empty()) {
+         bin_mappers[i]->FindBin(sample_values[i], num_per_col[i], total_sample_size,
+                                 config_.max_bin, config_.min_data_in_bin, filter_cnt, config_.feature_pre_filter,
+                                 bin_type, config_.use_missing, config_.zero_as_missing,
+@@ -1146,9 +1191,15 @@ void DatasetLoader::ConstructBinMappersFromTextData(int rank, int num_machines,
+       BinType bin_type = BinType::NumericalBin;
+       if (categorical_features_.count(i)) {
+         bin_type = BinType::CategoricalBin;
++      } else if (circular_features_.count(i)) {
++        bin_type = BinType::CircularBin;
+       }
+       bin_mappers[i].reset(new BinMapper());
+-      if (config_.max_bin_by_feature.empty()) {
++      if (bin_type == BinType::CircularBin) {
++        // ArcBoost: skip FindBin — InitAsCircular sets up the modular arc-bin grid.
++        MissingType mt = config_.use_missing ? MissingType::NaN : MissingType::None;
++        bin_mappers[i]->InitAsCircular(config_.max_bin_circular, config_.circular_period, mt);
++      } else if (config_.max_bin_by_feature.empty()) {
+         bin_mappers[i]->FindBin(sample_values[i].data(), static_cast<int>(sample_values[i].size()),
+                                 sample_data.size(), config_.max_bin, config_.min_data_in_bin,
+                                 filter_cnt, config_.feature_pre_filter, bin_type, config_.use_missing, config_.zero_as_missing,

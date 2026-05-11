@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:26:36 +0200
+Subject: [PATCH 09/13] ArcBoost: distributed tree learners reject
+ circular_feature
+
+Both data-parallel and voting-parallel tree learners require feature-local
+aggregation protocols that don't yet handle arc-bitset reductions. Rather
+than silently producing inconsistent splits across machines, fail loudly
+in Init() when circular_feature is non-empty.
+
+Single-machine training (the SerialTreeLearner path) is unaffected. Adding
+distributed support is tracked as a v0.2 follow-up.
+
+Note: LightGBM's CHECK macro doesn't support glog-style operator<< streaming,
+so the guard is written as an explicit if + Log::Fatal rather than
+CHECK(...) << "msg".
+---
+ src/treelearner/data_parallel_tree_learner.cpp   | 9 +++++++++
+ src/treelearner/voting_parallel_tree_learner.cpp | 9 +++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/src/treelearner/data_parallel_tree_learner.cpp b/src/treelearner/data_parallel_tree_learner.cpp
+index 67078811..0b244f04 100644
+--- a/src/treelearner/data_parallel_tree_learner.cpp
++++ b/src/treelearner/data_parallel_tree_learner.cpp
+@@ -21,6 +21,15 @@ DataParallelTreeLearner<TREELEARNER_T>::~DataParallelTreeLearner() {
+ 
+ template <typename TREELEARNER_T>
+ void DataParallelTreeLearner<TREELEARNER_T>::Init(const Dataset* train_data, bool is_constant_hessian) {
++  // ArcBoost: distributed (data-parallel) training of circular features is not
++  // yet implemented. The arc-search finder must be reduced across machines in
++  // the same way the categorical Fisher-search is, but the bitset-aggregation
++  // protocol assumes a fixed sort order (CTR) that doesn't apply to arcs.
++  if (!this->config_->circular_feature.empty()) {
++    Log::Fatal("ArcBoost: distributed (data-parallel) training does not yet "
++               "support circular_feature. Train on a single machine, or set "
++               "circular_feature='' to fall back to categorical/numerical handling.");
++  }
+   // initialize SerialTreeLearner
+   TREELEARNER_T::Init(train_data, is_constant_hessian);
+   // Get local rank and global machine size
+diff --git a/src/treelearner/voting_parallel_tree_learner.cpp b/src/treelearner/voting_parallel_tree_learner.cpp
+index 37f2d4cf..d086082d 100644
+--- a/src/treelearner/voting_parallel_tree_learner.cpp
++++ b/src/treelearner/voting_parallel_tree_learner.cpp
+@@ -20,6 +20,15 @@ VotingParallelTreeLearner<TREELEARNER_T>::VotingParallelTreeLearner(const Config
+ 
+ template <typename TREELEARNER_T>
+ void VotingParallelTreeLearner<TREELEARNER_T>::Init(const Dataset* train_data, bool is_constant_hessian) {
++  // ArcBoost: distributed (voting-parallel) training does not yet support
++  // circular features. Same reasoning as data_parallel_tree_learner — the
++  // top-K vote aggregation assumes a feature-local ordering that the arc
++  // bitset doesn't have. Fail with a clear message.
++  if (!this->config_->circular_feature.empty()) {
++    Log::Fatal("ArcBoost: distributed (voting-parallel) training does not yet "
++               "support circular_feature. Train on a single machine, or set "
++               "circular_feature='' to fall back to categorical/numerical handling.");
++  }
+   TREELEARNER_T::Init(train_data, is_constant_hessian);
+   rank_ = Network::rank();
+   num_machines_ = Network::num_machines();

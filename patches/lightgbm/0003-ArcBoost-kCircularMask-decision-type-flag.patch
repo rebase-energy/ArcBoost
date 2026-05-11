@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:08:41 +0200
+Subject: [PATCH 03/13] ArcBoost: kCircularMask decision-type flag
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Reserves bit 4 of decision_type_ for marking a split as circular (arc) rather
+than linear-threshold. The arc-membership bitset rides on the existing
+cat_threshold_ / cat_boundaries_ machinery, so circular splits also set
+kCategoricalMask — downstream bitset-decode paths work unchanged.
+
+A follow-up patch wires Tree::SplitCircular() (the analog of SplitCategorical)
+and the storage-side helpers; this patch just lands the flag so other patches
+can reference it. No behavior change yet.
+---
+ include/LightGBM/tree.h | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/include/LightGBM/tree.h b/include/LightGBM/tree.h
+index bc5af621..dd105e6b 100644
+--- a/include/LightGBM/tree.h
++++ b/include/LightGBM/tree.h
+@@ -19,6 +19,18 @@ namespace LightGBM {
+ 
+ #define kCategoricalMask (1)
+ #define kDefaultLeftMask (2)
++// ArcBoost: bit 4 marks a split as circular (arc-membership) rather than a
++// linear threshold. Circular splits also set kCategoricalMask so downstream
++// bitset-decode paths (cat_threshold_ / cat_boundaries_) can be reused
++// without modification — an arc on B bins is a contiguous bit-run with mod-B
++// wraparound, structurally identical to a categorical subset.
++//
++// Disambiguation: a split is circular iff (decision_type & kCircularMask).
++// Code that today branches on kCategoricalMask alone will continue to treat
++// circular splits as categorical (correct: same bitset decode); code that
++// needs to distinguish for reporting / feature importance must check the
++// circular bit explicitly.
++#define kCircularMask (16)
+ 
+ /*!
+ * \brief Tree model

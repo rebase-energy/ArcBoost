@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:13:44 +0200
+Subject: [PATCH 08/13] ArcBoost: rename python-package/lightgbm/ to
+ python-package/arcboost/
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Critical patch for the user-facing import path. After this lands:
+
+    import arcboost
+    from arcboost import LGBMRegressor, Dataset, train
+
+are the canonical entry points. All 19 internal cross-module imports inside
+the package are relative ('from .basic import ...'), so the rename is purely
+mechanical: rename the directory, update python-package/pyproject.toml's
+[project].name from 'lightgbm' to 'arcboost', and bump the version to
+0.1.0.dev0.
+
+Internal class names (LGBMRegressor, LGBMClassifier, Booster, Dataset,
+etc.) are preserved on purpose — they're widely-known and documented under
+those names; renaming them to ArcBoostRegressor would break drop-in
+substitution for users migrating from a vanilla LightGBM workflow.
+
+Note: the compiled C library is still produced as lib_lightgbm.{so,dylib,dll}
+and discovered by libpath.py via parents[1]/parents[0] traversal — the
+filename stays unchanged because (a) renaming it costs ABI bookkeeping for
+zero user benefit and (b) keeping the upstream CMake target name minimizes
+patch-rebase friction during future LightGBM bumps.
+---
+ python-package/arcboost/VERSION.txt               |  1 +
+ python-package/{lightgbm => arcboost}/__init__.py | 13 +++++++++++--
+ python-package/{lightgbm => arcboost}/basic.py    |  0
+ python-package/{lightgbm => arcboost}/callback.py |  0
+ python-package/{lightgbm => arcboost}/compat.py   |  0
+ python-package/{lightgbm => arcboost}/dask.py     |  0
+ python-package/{lightgbm => arcboost}/engine.py   |  0
+ python-package/{lightgbm => arcboost}/libpath.py  |  0
+ python-package/{lightgbm => arcboost}/plotting.py |  0
+ python-package/{lightgbm => arcboost}/py.typed    |  0
+ python-package/{lightgbm => arcboost}/sklearn.py  |  0
+ python-package/pyproject.toml                     |  4 ++--
+ 12 files changed, 14 insertions(+), 4 deletions(-)
+ create mode 100644 python-package/arcboost/VERSION.txt
+ rename python-package/{lightgbm => arcboost}/__init__.py (69%)
+ rename python-package/{lightgbm => arcboost}/basic.py (100%)
+ rename python-package/{lightgbm => arcboost}/callback.py (100%)
+ rename python-package/{lightgbm => arcboost}/compat.py (100%)
+ rename python-package/{lightgbm => arcboost}/dask.py (100%)
+ rename python-package/{lightgbm => arcboost}/engine.py (100%)
+ rename python-package/{lightgbm => arcboost}/libpath.py (100%)
+ rename python-package/{lightgbm => arcboost}/plotting.py (100%)
+ rename python-package/{lightgbm => arcboost}/py.typed (100%)
+ rename python-package/{lightgbm => arcboost}/sklearn.py (100%)
+
+diff --git a/python-package/arcboost/VERSION.txt b/python-package/arcboost/VERSION.txt
+new file mode 100644
+index 00000000..1821d33c
+--- /dev/null
++++ b/python-package/arcboost/VERSION.txt
+@@ -0,0 +1 @@
++0.1.0.dev0
+diff --git a/python-package/lightgbm/__init__.py b/python-package/arcboost/__init__.py
+similarity index 69%
+rename from python-package/lightgbm/__init__.py
+rename to python-package/arcboost/__init__.py
+index b679b3f6..2439616d 100644
+--- a/python-package/lightgbm/__init__.py
++++ b/python-package/arcboost/__init__.py
+@@ -1,7 +1,12 @@
+ # coding: utf-8
+-"""LightGBM, Light Gradient Boosting Machine.
++"""ArcBoost — gradient boosting with first-class circular feature splits.
+ 
+-Contributors: https://github.com/microsoft/LightGBM/graphs/contributors.
++A fork of LightGBM v4.6.0 (https://github.com/microsoft/LightGBM) that adds
++the `circular` feature type for splits over arcs `[a, b] mod period` rather
++than linear thresholds. Pass `circular_feature` (and optionally
++`circular_period`, `max_bin_circular`) in the parameter dict to opt in.
++
++Upstream LightGBM contributors: https://github.com/microsoft/LightGBM/graphs/contributors.
+ """
+ 
+ from pathlib import Path
+@@ -29,6 +34,10 @@ except ImportError:
+ _version_path = Path(__file__).absolute().parent / "VERSION.txt"
+ if _version_path.is_file():
+     __version__ = _version_path.read_text(encoding="utf-8").strip()
++else:
++    # Fallback when packaged without VERSION.txt (e.g., source checkouts that
++    # haven't been built through scikit-build-core yet).
++    __version__ = "0.1.0.dev0"
+ 
+ __all__ = [
+     "Dataset",
+diff --git a/python-package/lightgbm/basic.py b/python-package/arcboost/basic.py
+similarity index 100%
+rename from python-package/lightgbm/basic.py
+rename to python-package/arcboost/basic.py
+diff --git a/python-package/lightgbm/callback.py b/python-package/arcboost/callback.py
+similarity index 100%
+rename from python-package/lightgbm/callback.py
+rename to python-package/arcboost/callback.py
+diff --git a/python-package/lightgbm/compat.py b/python-package/arcboost/compat.py
+similarity index 100%
+rename from python-package/lightgbm/compat.py
+rename to python-package/arcboost/compat.py
+diff --git a/python-package/lightgbm/dask.py b/python-package/arcboost/dask.py
+similarity index 100%
+rename from python-package/lightgbm/dask.py
+rename to python-package/arcboost/dask.py
+diff --git a/python-package/lightgbm/engine.py b/python-package/arcboost/engine.py
+similarity index 100%
+rename from python-package/lightgbm/engine.py
+rename to python-package/arcboost/engine.py
+diff --git a/python-package/lightgbm/libpath.py b/python-package/arcboost/libpath.py
+similarity index 100%
+rename from python-package/lightgbm/libpath.py
+rename to python-package/arcboost/libpath.py
+diff --git a/python-package/lightgbm/plotting.py b/python-package/arcboost/plotting.py
+similarity index 100%
+rename from python-package/lightgbm/plotting.py
+rename to python-package/arcboost/plotting.py
+diff --git a/python-package/lightgbm/py.typed b/python-package/arcboost/py.typed
+similarity index 100%
+rename from python-package/lightgbm/py.typed
+rename to python-package/arcboost/py.typed
+diff --git a/python-package/lightgbm/sklearn.py b/python-package/arcboost/sklearn.py
+similarity index 100%
+rename from python-package/lightgbm/sklearn.py
+rename to python-package/arcboost/sklearn.py
+diff --git a/python-package/pyproject.toml b/python-package/pyproject.toml
+index fa281078..29f5b266 100644
+--- a/python-package/pyproject.toml
++++ b/python-package/pyproject.toml
+@@ -28,10 +28,10 @@ license = {file = "LICENSE"}
+ maintainers = [
+   {name = "Yu Shi", email = "yushi@microsoft.com"}
+ ]
+-name = "lightgbm"
++name = "arcboost"
+ readme = "README.rst"
+ requires-python = ">=3.7"
+-version = "4.6.0"
++version = "0.1.0.dev0"
+ 
+ [project.optional-dependencies]
+ arrow = [

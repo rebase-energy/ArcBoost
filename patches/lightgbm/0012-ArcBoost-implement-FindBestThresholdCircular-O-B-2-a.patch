@@ -1,0 +1,225 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:47:50 +0200
+Subject: [PATCH 12/13] ArcBoost: implement FindBestThresholdCircular (O(B^2)
+ arc-search)
+
+Replaces the v0.1.0.dev0 Log::Fatal stub with the real arc-search:
+
+  1. Build doubled cyclic prefix sums of (g, h) over num_real_bins
+     histogram entries (skipping the NaN bin when missing_type == NaN).
+  2. Scan arcs (start, length) with start in [0, B) and length in [1, B/2],
+     pruning complement arcs since they yield identical gains.
+  3. For each candidate compute G_in / H_in via prefix subtraction, enforce
+     min_data_in_leaf and min_sum_hessian_in_leaf, score with GetSplitGains,
+     track the best.
+  4. Materialize the chosen arc as bin indices in output->cat_threshold.
+     Tree::Decide handles bitset-membership via the categorical decode path
+     (kCategoricalMask | kCircularMask), so no inference-time changes.
+
+Templated booleans collapse to false; monotone is rejected upstream for
+circular features. L1 / smoothing / extra-trees randomization can be added
+later by mirroring FuncForCategorical{,L1,L2}'s template-instantiation tree.
+---
+ src/io/bin.cpp                        |  15 ++-
+ src/treelearner/feature_histogram.cpp | 155 ++++++++++++++++++++++----
+ 2 files changed, 145 insertions(+), 25 deletions(-)
+
+diff --git a/src/io/bin.cpp b/src/io/bin.cpp
+index d77765fb..c98aeaa9 100644
+--- a/src/io/bin.cpp
++++ b/src/io/bin.cpp
+@@ -1107,11 +1107,18 @@ void BinMapper::InitAsCircular(int num_bin, double period, MissingType missing_t
+   bin_upper_bound_.clear();
+   categorical_2_bin_.clear();
+   bin_2_categorical_.clear();
+-  // Now that all fields driving ValueToBin are set, compute default_bin_ and
+-  // most_freq_bin_. For a uniform circular distribution, the choice doesn't
+-  // matter for correctness — pick the bin containing 0.0.
++  // Now that all fields driving ValueToBin are set, compute default_bin_.
+   default_bin_ = ValueToBin(0.0);
+-  most_freq_bin_ = default_bin_;
++  // ArcBoost: deliberately set most_freq_bin_ to a *non-zero* value so the
++  // FeatureMetainfo::offset gets set to 0 (see SetFeatureInfo in
++  // feature_histogram.hpp: `if (GetMostFreqBin() == 0) offset = 1`). With
++  // offset = 1 the histogram is sized num_bin - 1 and the per-bin data_
++  // pointer would not contain entries for the last bin — our arc-search
++  // would then read past the end and segfault. There is no genuine "most
++  // frequent" bin for a uniform circular feature, so picking bin 1 is
++  // arbitrary but harmless. Pinning the value to (num_bin - 1) would also
++  // work — the only constraint is "not zero".
++  most_freq_bin_ = (num_bin_ > 1) ? 1u : 0u;
+ }
+ 
+ }  // namespace LightGBM
+diff --git a/src/treelearner/feature_histogram.cpp b/src/treelearner/feature_histogram.cpp
+index 6d03d08d..bc976d5b 100644
+--- a/src/treelearner/feature_histogram.cpp
++++ b/src/treelearner/feature_histogram.cpp
+@@ -736,32 +736,145 @@ void FeatureHistogram::FindBestThresholdCategoricalIntInner(int64_t int_sum_grad
+   }
+ }
+ 
+-// ArcBoost: arc-membership split-finder stub.
++// ArcBoost: arc-membership split-finder.
+ //
+-// Status: declared but not yet implemented. The full O(B^2) cyclic-prefix-sum
+-// arc-search is described in the comment block on the declaration in
+-// feature_histogram.hpp. Until that lands, dispatch routes to this stub which
+-// errors with a clear message. With this stub in place, the build links and
+-// the rest of the patch series (config, dispatch, Python API) can be tested
+-// against non-circular workloads.
++// O(B^2) scan over arcs (start, length) using doubled cyclic prefix sums of
++// the per-bin (g, h) histogram, with length pruned to <= B/2 since complement
++// arcs yield identical gains. Produces a SplitInfo whose cat_threshold lists
++// the bin indices inside the chosen arc; the existing categorical decode path
++// in Tree::Decide then routes a row to the "right" branch iff its bin is in
++// the bitset, which is exactly arc-membership.
+ //
+-// To implement: model on FindBestThresholdCategoricalInner above. Reuse
+-// GetSplitGains<USE_MC, USE_L1, USE_MAX_OUTPUT, USE_SMOOTHING>() for gain
+-// computation, and emit the chosen arc as a bitset in output->cat_threshold
+-// so the existing categorical decode path in Tree::Decide handles it.
+-void FeatureHistogram::FindBestThresholdCircular(double /*sum_gradient*/,
+-                                                 double /*sum_hessian*/,
+-                                                 data_size_t /*num_data*/,
++// Limitations of v0.1.0.dev0 (kept simple):
++//   - Templated booleans (USE_RAND / USE_MC / USE_L1 / USE_MAX_OUTPUT /
++//     USE_SMOOTHING) collapse to false. Monotone constraints on circular
++//     features are rejected upstream in dataset_loader.cpp; L1, max_output,
++//     and smoothing are tunables that can be threaded in later by mirroring
++//     the FuncForCategorical{,L1,L2} template-instantiation tree.
++void FeatureHistogram::FindBestThresholdCircular(double sum_gradient,
++                                                 double sum_hessian,
++                                                 data_size_t num_data,
+                                                  const FeatureConstraint* /*constraints*/,
+-                                                 double /*parent_output*/,
++                                                 double parent_output,
+                                                  SplitInfo* output) {
+-  output->gain = kMinScore;
+   is_splittable_ = false;
+-  Log::Fatal(
+-      "ArcBoost: circular split-finder is declared but not yet implemented "
+-      "(v0.1.0.dev0). Remove the `circular_feature` parameter to fall back "
+-      "to LightGBM's default numerical/categorical handling, or contribute "
+-      "the implementation per the algorithm spec in feature_histogram.hpp.");
++  output->default_left = false;
++  output->gain = kMinScore;
++
++  const int total_bins = meta_->num_bin;
++  const bool has_nan_bin = (meta_->missing_type == MissingType::NaN);
++  // The NaN bin (if present) is at the highest index and does not participate
++  // in the cyclic ring — exclude it from the arc-search.
++  const int num_real_bins = has_nan_bin ? (total_bins - 1) : total_bins;
++  if (num_real_bins < 2) {
++    return;
++  }
++
++  // ArcBoost: histogram base index is 0. InitAsCircular sets most_freq_bin_
++  // to a non-zero value, which forces meta_->offset == 0 in SetFeatureInfo,
++  // so the histogram is sized num_bin (full) and bins 0..num_bin-1 are all
++  // valid. We deliberately *don't* use the (1 - meta_->offset) convention
++  // borrowed from FindBestThresholdCategoricalInner because that convention
++  // skips the bin containing the most-frequent category — for a uniform
++  // circular feature there is no special bin to skip.
++  const int hist_base = 0;
++
++  std::vector<double> g_pref(2 * num_real_bins + 1, 0.0);
++  std::vector<double> h_pref(2 * num_real_bins + 1, 0.0);
++  for (int i = 0; i < 2 * num_real_bins; ++i) {
++    const int b = (i % num_real_bins) + hist_base;
++    g_pref[i + 1] = g_pref[i] + GET_GRAD(data_, b);
++    h_pref[i + 1] = h_pref[i] + GET_HESS(data_, b);
++  }
++
++  const double l1 = meta_->config->lambda_l1;
++  const double l2 = meta_->config->lambda_l2;
++  const double max_delta_step = meta_->config->max_delta_step;
++  const double gain_shift = GetLeafGain<false, false, false>(
++      sum_gradient, sum_hessian, l1, l2, max_delta_step, 0,
++      num_data, 0);
++  const double min_gain_shift = gain_shift + meta_->config->min_gain_to_split;
++
++  const double cnt_factor = num_data / sum_hessian;
++  const data_size_t min_data_in_leaf = meta_->config->min_data_in_leaf;
++  const double min_sum_hessian_in_leaf = meta_->config->min_sum_hessian_in_leaf;
++
++  int best_start = -1;
++  int best_length = -1;
++  double best_gain = kMinScore;
++  double best_g_in = 0.0;
++  double best_h_in = 0.0;
++  data_size_t best_count_in = 0;
++
++  // Complement arcs (length > B/2) are equivalent to the arc with the same
++  // membership swapped, so length in [1, B/2] covers every distinct partition.
++  const int max_length = num_real_bins / 2;
++
++  for (int start = 0; start < num_real_bins; ++start) {
++    for (int length = 1; length <= max_length; ++length) {
++      const double g_in = g_pref[start + length] - g_pref[start];
++      const double h_in = h_pref[start + length] - h_pref[start];
++      const data_size_t cnt_in =
++          static_cast<data_size_t>(Common::RoundInt(h_in * cnt_factor));
++      const data_size_t cnt_out = num_data - cnt_in;
++
++      if (cnt_in < min_data_in_leaf || cnt_out < min_data_in_leaf) {
++        continue;
++      }
++      if (h_in < min_sum_hessian_in_leaf ||
++          (sum_hessian - h_in) < min_sum_hessian_in_leaf) {
++        continue;
++      }
++
++      const double g_out = sum_gradient - g_in;
++      const double h_out = sum_hessian - h_in;
++
++      // Treat the arc-interior as the "right" branch, mirroring the
++      // categorical finder where cat_threshold lists right-branch bins.
++      const double gain = GetSplitGains<false, false, false, false>(
++          g_out, h_out - kEpsilon, g_in, h_in + kEpsilon,
++          l1, l2, max_delta_step,
++          /*constraints=*/nullptr,
++          /*monotone_constraint=*/0,
++          /*smoothing=*/0.0,
++          cnt_out, cnt_in, parent_output);
++
++      if (gain <= min_gain_shift) {
++        continue;
++      }
++      is_splittable_ = true;
++      if (gain > best_gain) {
++        best_gain = gain;
++        best_start = start;
++        best_length = length;
++        best_g_in = g_in;
++        best_h_in = h_in;
++        best_count_in = cnt_in;
++      }
++    }
++  }
++
++  if (best_start < 0) {
++    return;
++  }
++
++  // Emit the arc as a list of bin indices in output->cat_threshold (right-side).
++  output->num_cat_threshold = best_length;
++  output->cat_threshold = std::vector<uint32_t>(best_length);
++  for (int i = 0; i < best_length; ++i) {
++    const int bin_idx = ((best_start + i) % num_real_bins) + hist_base;
++    output->cat_threshold[i] = static_cast<uint32_t>(bin_idx);
++  }
++
++  output->left_count = num_data - best_count_in;
++  output->right_count = best_count_in;
++  output->left_sum_gradient = sum_gradient - best_g_in;
++  output->right_sum_gradient = best_g_in;
++  output->left_sum_hessian = sum_hessian - best_h_in - kEpsilon;
++  output->right_sum_hessian = best_h_in + kEpsilon;
++  output->gain = best_gain - min_gain_shift;
++  output->default_left = false;
++  output->monotone_type = 0;
+ }
+ 
+ }  // namespace LightGBM

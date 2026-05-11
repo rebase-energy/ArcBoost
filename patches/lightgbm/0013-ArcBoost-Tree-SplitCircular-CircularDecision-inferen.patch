@@ -1,0 +1,359 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 23:06:25 +0200
+Subject: [PATCH 13/13] ArcBoost: Tree::SplitCircular + CircularDecision
+ inference path
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes the loop between training-time arc-search and inference-time decode.
+The arc-search produces a SplitInfo whose cat_threshold lists the in-arc
+bin indices; previously the serial tree learner routed this through
+SplitCategorical which (a) crashed when BinToValue accessed the empty
+bin_2_categorical_ vector and (b) wouldn't have decoded correctly even if
+it had, since CategoricalDecision casts the raw feature value to int rather
+than computing the bin via modular arithmetic.
+
+This patch:
+  - Adds Tree::SplitCircular(), structurally identical to SplitCategorical
+    plus (period, num_bins) parameters that get appended to two new
+    parallel vectors circular_period_ / circular_num_bins_ indexed by
+    cat_idx. SplitCategorical now also pushes (0, 0) sentinels so cat_idx
+    stays a valid index into all three vectors.
+  - Adds Tree::CircularDecision(), which on a raw feature value computes
+    bin = floor(fmod(fval, period) / period * num_bins) and FindInBitset's
+    over the inner (bin-index) bitset just like CategoricalDecisionInner.
+  - Updates Tree::Decision() to dispatch on kCircularMask first (since
+    circular splits also set kCategoricalMask for the bitset machinery).
+  - Patches BinMapper::BinToValue() to return the bin index unchanged for
+    CircularBin features — there is no integer category code for arc bins,
+    the bin index *is* the identity, and the outer bitset stores those
+    same indices.
+  - Updates serial_tree_learner.cpp to detect circular features and route
+    to SplitCircular with period + num_bins from the BinMapper.
+---
+ include/LightGBM/bin.h                  |  7 +++
+ include/LightGBM/tree.h                 | 64 +++++++++++++++++++++++-
+ src/io/tree.cpp                         | 65 +++++++++++++++++++++++++
+ src/treelearner/feature_histogram.cpp   | 24 ++++++---
+ src/treelearner/serial_tree_learner.cpp | 58 ++++++++++++++++------
+ 5 files changed, 196 insertions(+), 22 deletions(-)
+
+diff --git a/include/LightGBM/bin.h b/include/LightGBM/bin.h
+index 59c907c4..18643a41 100644
+--- a/include/LightGBM/bin.h
++++ b/include/LightGBM/bin.h
+@@ -143,6 +143,13 @@ class BinMapper {
+   inline double BinToValue(uint32_t bin) const {
+     if (bin_type_ == BinType::NumericalBin) {
+       return bin_upper_bound_[bin];
++    } else if (bin_type_ == BinType::CircularBin) {
++      // ArcBoost: circular features have no integer category code per bin;
++      // the bin index *is* the meaningful identity (it indexes into a uniform
++      // grid on [0, period)). The serial_tree_learner builds the outer bitset
++      // by mapping cat_threshold (bin indices) through this function and then
++      // FindInBitset-ing — so returning the bin index round-trips correctly.
++      return static_cast<double>(bin);
+     } else {
+       return bin_2_categorical_[bin];
+     }
+diff --git a/include/LightGBM/tree.h b/include/LightGBM/tree.h
+index dd105e6b..e237bb62 100644
+--- a/include/LightGBM/tree.h
++++ b/include/LightGBM/tree.h
+@@ -99,6 +99,19 @@ class Tree {
+                        const uint32_t* threshold, int num_threshold, double left_value, double right_value,
+                        int left_cnt, int right_cnt, double left_weight, double right_weight, float gain, MissingType missing_type);
+ 
++  // ArcBoost: arc-membership split. Identical to SplitCategorical except
++  // that decision_type also carries kCircularMask, and (period, num_bins)
++  // are stored alongside cat_boundaries_ so CircularDecision can recompute
++  // the bin from a raw feature value at inference time.
++  int SplitCircular(int leaf, int feature, int real_feature,
++                    const uint32_t* threshold_bin, int num_threshold_bin,
++                    const uint32_t* threshold, int num_threshold,
++                    double period, int num_bins,
++                    double left_value, double right_value,
++                    int left_cnt, int right_cnt,
++                    double left_weight, double right_weight,
++                    float gain, MissingType missing_type);
++
+   /*! \brief Get the output of one leaf */
+   inline double LeafOutput(int leaf) const { return leaf_value_[leaf]; }
+ 
+@@ -410,8 +423,49 @@ class Tree {
+     return right_child_[node];
+   }
+ 
++  // ArcBoost: route a raw circular feature value through the arc bitset.
++  // Computes bin = floor(fmod(fval, period) / period * num_bins) using the
++  // period and num_bins stored at split-time, then checks membership in
++  // cat_threshold_inner_ exactly like CategoricalDecisionInner.
++  inline int CircularDecision(double fval, int node) const {
++    if (std::isnan(fval)) {
++      return right_child_[node];
++    }
++    const int cat_idx = static_cast<int>(threshold_[node]);
++    if (cat_idx < 0 || cat_idx >= static_cast<int>(circular_period_.size())
++        || cat_idx >= static_cast<int>(circular_num_bins_.size())) {
++      return right_child_[node];
++    }
++    const double period = circular_period_[cat_idx];
++    const int num_bins = circular_num_bins_[cat_idx];
++    if (period <= 0.0 || num_bins <= 0) {
++      return right_child_[node];
++    }
++    double r = std::fmod(fval, period);
++    if (r < 0.0) r += period;
++    int bin = static_cast<int>(std::floor(r / period * num_bins));
++    if (bin < 0) bin = 0;
++    if (bin >= num_bins) bin = num_bins - 1;
++    // ArcBoost: cat_threshold_inner_ is not serialized to model.txt (only the
++    // outer cat_threshold_ is). For circular features BinToValue returns the
++    // bin index unchanged, so cat_threshold_ also stores bin indices — use it
++    // here so this works after a model round-trip.
++    if (cat_idx + 1 >= static_cast<int>(cat_boundaries_.size())) {
++      return right_child_[node];
++    }
++    if (Common::FindInBitset(
++            cat_threshold_.data() + cat_boundaries_[cat_idx],
++            cat_boundaries_[cat_idx + 1] - cat_boundaries_[cat_idx],
++            static_cast<uint32_t>(bin))) {
++      return left_child_[node];
++    }
++    return right_child_[node];
++  }
++
+   inline int Decision(double fval, int node) const {
+-    if (GetDecisionType(decision_type_[node], kCategoricalMask)) {
++    if (GetDecisionType(decision_type_[node], kCircularMask)) {
++      return CircularDecision(fval, node);
++    } else if (GetDecisionType(decision_type_[node], kCategoricalMask)) {
+       return CategoricalDecision(fval, node);
+     } else {
+       return NumericalDecision(fval, node);
+@@ -419,6 +473,7 @@ class Tree {
+   }
+ 
+   inline int DecisionInner(uint32_t fval, int node, uint32_t default_bin, uint32_t max_bin) const {
++    // For inner-bin decisions, circular shares the bitset path with categorical.
+     if (GetDecisionType(decision_type_[node], kCategoricalMask)) {
+       return CategoricalDecisionInner(fval, node);
+     } else {
+@@ -509,6 +564,13 @@ class Tree {
+   std::vector<uint32_t> cat_threshold_inner_;
+   std::vector<int> cat_boundaries_;
+   std::vector<uint32_t> cat_threshold_;
++  // ArcBoost: per-category-index circular metadata. For categorical splits
++  // these entries are unused (period stays 0, num_bins stays 0). For circular
++  // splits, period > 0 and num_bins > 0, and CircularDecision uses them to
++  // compute the row's bin from a raw feature value at inference time.
++  // Indexed by cat_idx (the same index used for cat_boundaries_).
++  std::vector<double> circular_period_;
++  std::vector<int> circular_num_bins_;
+   /*! \brief Store the information for categorical feature handle and missing value handle. */
+   std::vector<int8_t> decision_type_;
+   /*! \brief A non-leaf node's split gain */
+diff --git a/src/io/tree.cpp b/src/io/tree.cpp
+index 975f09d2..fc26f07c 100644
+--- a/src/io/tree.cpp
++++ b/src/io/tree.cpp
+@@ -93,6 +93,48 @@ int Tree::SplitCategorical(int leaf, int feature, int real_feature, const uint32
+   for (int i = 0; i < num_threshold_bin; ++i) {
+     cat_threshold_inner_.push_back(threshold_bin[i]);
+   }
++  // ArcBoost: keep circular_period_ / circular_num_bins_ in lock-step with
++  // cat_boundaries_ so cat_idx is a valid index into all three vectors. For a
++  // categorical split, period == 0 sentinel marks "not circular".
++  circular_period_.push_back(0.0);
++  circular_num_bins_.push_back(0);
++  ++num_leaves_;
++  return num_leaves_ - 1;
++}
++
++int Tree::SplitCircular(int leaf, int feature, int real_feature,
++                        const uint32_t* threshold_bin, int num_threshold_bin,
++                        const uint32_t* threshold, int num_threshold,
++                        double period, int num_bins,
++                        double left_value, double right_value,
++                        data_size_t left_cnt, data_size_t right_cnt,
++                        double left_weight, double right_weight,
++                        float gain, MissingType missing_type) {
++  Split(leaf, feature, real_feature, left_value, right_value, left_cnt, right_cnt, left_weight, right_weight, gain);
++  int new_node_idx = num_leaves_ - 1;
++  decision_type_[new_node_idx] = 0;
++  // ArcBoost: arc splits also flag kCategoricalMask so the inner (bin-bitset)
++  // decode path that data_partition uses works without modification — the
++  // outer-decode path (CircularDecision) is selected by kCircularMask first.
++  // ORDER MATTERS: SetMissingType does `decision_type &= 3` to clear bits 2-7
++  // before writing the missing-type at bits 2-3, so kCircularMask (bit 4)
++  // must be set AFTER SetMissingType or it would be wiped.
++  SetDecisionType(&decision_type_[new_node_idx], true, kCategoricalMask);
++  SetMissingType(&decision_type_[new_node_idx], static_cast<int8_t>(missing_type));
++  SetDecisionType(&decision_type_[new_node_idx], true, kCircularMask);
++  threshold_in_bin_[new_node_idx] = num_cat_;
++  threshold_[new_node_idx] = num_cat_;
++  ++num_cat_;
++  cat_boundaries_.push_back(cat_boundaries_.back() + num_threshold);
++  for (int i = 0; i < num_threshold; ++i) {
++    cat_threshold_.push_back(threshold[i]);
++  }
++  cat_boundaries_inner_.push_back(cat_boundaries_inner_.back() + num_threshold_bin);
++  for (int i = 0; i < num_threshold_bin; ++i) {
++    cat_threshold_inner_.push_back(threshold_bin[i]);
++  }
++  circular_period_.push_back(period);
++  circular_num_bins_.push_back(num_bins);
+   ++num_leaves_;
+   return num_leaves_ - 1;
+ }
+@@ -373,6 +415,13 @@ std::string Tree::ToString() const {
+       << ArrayToString(cat_boundaries_, num_cat_ + 1) << '\n';
+     str_buf << "cat_threshold="
+       << ArrayToString(cat_threshold_, cat_threshold_.size()) << '\n';
++    // ArcBoost: per-cat-idx (period, num_bins). Always written when num_cat_
++    // > 0 so the deserializer can reconstruct CircularDecision state. For
++    // non-circular splits these entries are 0.0/0 sentinels.
++    str_buf << "circular_period="
++      << ArrayToString(circular_period_, circular_period_.size()) << '\n';
++    str_buf << "circular_num_bins="
++      << ArrayToString(circular_num_bins_, circular_num_bins_.size()) << '\n';
+   }
+   str_buf << "is_linear=" << is_linear_ << '\n';
+ 
+@@ -861,6 +910,22 @@ Tree::Tree(const char* str, size_t* used_len) {
+     } else {
+       Log::Fatal("Tree model should contain cat_threshold field");
+     }
++    // ArcBoost: optional fields written by the patched serializer above.
++    // Older model files (and this same training run, since serialization is
++    // round-tripped between train and predict) won't have them — initialize
++    // to zero-sentinels so non-circular splits keep working unchanged. This
++    // also keeps the serializer/deserializer backward-compatible with stock
++    // LightGBM v4.6.0 model files that lack the fields entirely.
++    if (key_vals.count("circular_period")) {
++      circular_period_ = CommonC::StringToArrayFast<double>(key_vals["circular_period"], num_cat_);
++    } else {
++      circular_period_.assign(num_cat_, 0.0);
++    }
++    if (key_vals.count("circular_num_bins")) {
++      circular_num_bins_ = CommonC::StringToArrayFast<int>(key_vals["circular_num_bins"], num_cat_);
++    } else {
++      circular_num_bins_.assign(num_cat_, 0);
++    }
+   }
+   max_depth_ = -1;
+ }
+diff --git a/src/treelearner/feature_histogram.cpp b/src/treelearner/feature_histogram.cpp
+index bc976d5b..2de87d96 100644
+--- a/src/treelearner/feature_histogram.cpp
++++ b/src/treelearner/feature_histogram.cpp
+@@ -866,12 +866,24 @@ void FeatureHistogram::FindBestThresholdCircular(double sum_gradient,
+     output->cat_threshold[i] = static_cast<uint32_t>(bin_idx);
+   }
+ 
+-  output->left_count = num_data - best_count_in;
+-  output->right_count = best_count_in;
+-  output->left_sum_gradient = sum_gradient - best_g_in;
+-  output->right_sum_gradient = best_g_in;
+-  output->left_sum_hessian = sum_hessian - best_h_in - kEpsilon;
+-  output->right_sum_hessian = best_h_in + kEpsilon;
++  // LightGBM convention: LEFT branch is the bitset-membership-true side (the
++  // arc interior, since we store arc bins in cat_threshold). RIGHT is the
++  // arc exterior. CircularDecision returns left_child_ when FindInBitset
++  // returns true, completing the consistency.
++  output->left_count = best_count_in;
++  output->right_count = num_data - best_count_in;
++  output->left_sum_gradient = best_g_in;
++  output->right_sum_gradient = sum_gradient - best_g_in;
++  output->left_sum_hessian = best_h_in + kEpsilon;
++  output->right_sum_hessian = sum_hessian - best_h_in - kEpsilon;
++  output->left_output = CalculateSplittedLeafOutput<false, false, false>(
++      best_g_in, best_h_in + kEpsilon,
++      l1, l2, max_delta_step, /*smoothing=*/0.0,
++      output->left_count, parent_output);
++  output->right_output = CalculateSplittedLeafOutput<false, false, false>(
++      sum_gradient - best_g_in, sum_hessian - best_h_in - kEpsilon,
++      l1, l2, max_delta_step, /*smoothing=*/0.0,
++      output->right_count, parent_output);
+   output->gain = best_gain - min_gain_shift;
+   output->default_left = false;
+   output->monotone_type = 0;
+diff --git a/src/treelearner/serial_tree_learner.cpp b/src/treelearner/serial_tree_learner.cpp
+index 01cdd762..9fc8d305 100644
+--- a/src/treelearner/serial_tree_learner.cpp
++++ b/src/treelearner/serial_tree_learner.cpp
+@@ -776,9 +776,14 @@ void SerialTreeLearner::SplitInner(Tree* tree, int best_leaf, int* left_leaf,
+   constraints_->BeforeSplit(best_leaf, next_leaf_id,
+                             best_split_info.monotone_type);
+ 
++  const auto* split_bin_mapper = train_data_->FeatureBinMapper(inner_feature_index);
+   bool is_numerical_split =
+-      train_data_->FeatureBinMapper(inner_feature_index)->bin_type() ==
+-      BinType::NumericalBin;
++      split_bin_mapper->bin_type() == BinType::NumericalBin;
++  // ArcBoost: circular features use the bitset-based path (like categorical)
++  // for histogram routing, but emit a SplitCircular call so the tree records
++  // (period, num_bins) for inference-time arc membership testing.
++  bool is_circular_split =
++      split_bin_mapper->bin_type() == BinType::CircularBin;
+   if (is_numerical_split) {
+     auto threshold_double = train_data_->RealThreshold(
+         inner_feature_index, best_split_info.threshold);
+@@ -827,19 +832,42 @@ void SerialTreeLearner::SplitInner(Tree* tree, int best_leaf, int* left_leaf,
+       best_split_info.right_count = data_partition_->leaf_count(next_leaf_id);
+     }
+ 
+-    *right_leaf = tree->SplitCategorical(
+-        best_leaf, inner_feature_index, best_split_info.feature,
+-        cat_bitset_inner.data(), static_cast<int>(cat_bitset_inner.size()),
+-        cat_bitset.data(), static_cast<int>(cat_bitset.size()),
+-        static_cast<double>(best_split_info.left_output),
+-        static_cast<double>(best_split_info.right_output),
+-        static_cast<data_size_t>(best_split_info.left_count),
+-        static_cast<data_size_t>(best_split_info.right_count),
+-        static_cast<double>(best_split_info.left_sum_hessian),
+-        static_cast<double>(best_split_info.right_sum_hessian),
+-        // store the true split gain in tree model
+-        static_cast<float>(best_split_info.gain + config_->min_gain_to_split),
+-        train_data_->FeatureBinMapper(inner_feature_index)->missing_type());
++    if (is_circular_split) {
++      // ArcBoost: arc split — record period + num_bins so CircularDecision
++      // can recompute the bin from a raw feature value at inference time.
++      const double period = split_bin_mapper->circular_period();
++      const int num_bins =
++          (split_bin_mapper->missing_type() == MissingType::NaN)
++              ? (split_bin_mapper->num_bin() - 1)
++              : split_bin_mapper->num_bin();
++      *right_leaf = tree->SplitCircular(
++          best_leaf, inner_feature_index, best_split_info.feature,
++          cat_bitset_inner.data(), static_cast<int>(cat_bitset_inner.size()),
++          cat_bitset.data(), static_cast<int>(cat_bitset.size()),
++          period, num_bins,
++          static_cast<double>(best_split_info.left_output),
++          static_cast<double>(best_split_info.right_output),
++          static_cast<data_size_t>(best_split_info.left_count),
++          static_cast<data_size_t>(best_split_info.right_count),
++          static_cast<double>(best_split_info.left_sum_hessian),
++          static_cast<double>(best_split_info.right_sum_hessian),
++          static_cast<float>(best_split_info.gain + config_->min_gain_to_split),
++          split_bin_mapper->missing_type());
++    } else {
++      *right_leaf = tree->SplitCategorical(
++          best_leaf, inner_feature_index, best_split_info.feature,
++          cat_bitset_inner.data(), static_cast<int>(cat_bitset_inner.size()),
++          cat_bitset.data(), static_cast<int>(cat_bitset.size()),
++          static_cast<double>(best_split_info.left_output),
++          static_cast<double>(best_split_info.right_output),
++          static_cast<data_size_t>(best_split_info.left_count),
++          static_cast<data_size_t>(best_split_info.right_count),
++          static_cast<double>(best_split_info.left_sum_hessian),
++          static_cast<double>(best_split_info.right_sum_hessian),
++          // store the true split gain in tree model
++          static_cast<float>(best_split_info.gain + config_->min_gain_to_split),
++          train_data_->FeatureBinMapper(inner_feature_index)->missing_type());
++    }
+   }
+ 
+ #ifdef DEBUG

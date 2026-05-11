@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ArcBoost Builder <build@arcboost.local>
+Date: Sat, 9 May 2026 22:10:59 +0200
+Subject: [PATCH 06/13] ArcBoost: circular_feature, circular_period,
+ max_bin_circular config
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Adds three new Config parameters:
+
+  - circular_feature: list of feature indices/names to treat as circular,
+    mirroring the existing categorical_feature parameter syntax (including
+    the name:col1,col2 prefix form). Per-feature period overrides via
+    name:wind_dir=360,phase=6.283 syntax are supported (parsing handled by
+    a follow-up patch in src/io/config_*.cpp).
+  - circular_period: default period for circular features. Defaults to 2*pi
+    (radians); common alternatives are 360 (degrees), 24 (hour-of-day),
+    365.25 (day-of-year).
+  - max_bin_circular: max number of arc-bins per circular feature, default
+    64. Kept lower than max_bin (255) because arc-search is O(B^2); raise
+    toward 255 if higher angular resolution matters more than split-find
+    time.
+
+Pure declaration patch — the parsing logic for the per-feature period
+override syntax lives in src/io/config_*.cpp and is added separately.
+---
+ include/LightGBM/config.h | 22 ++++++++++++++++++++++
+ 1 file changed, 22 insertions(+)
+
+diff --git a/include/LightGBM/config.h b/include/LightGBM/config.h
+index 208f6bc6..d7607684 100644
+--- a/include/LightGBM/config.h
++++ b/include/LightGBM/config.h
+@@ -791,6 +791,28 @@ struct Config {
+   // desc = **Note**: floating point numbers in categorical features will be rounded towards 0
+   std::string categorical_feature = "";
+ 
++  // ArcBoost: circular feature support.
++  // type = multi-int or string
++  // alias = arc_feature, circular_column, arc_column, circular_features
++  // desc = used to specify circular features (features whose domain is a circle, e.g. wind direction, hour-of-day, day-of-year, phase angles)
++  // desc = use number for index, e.g. ``circular_feature=0,3`` means column\_0 and column\_3 are circular features
++  // desc = add a prefix ``name:`` for column name, e.g. ``circular_feature=name:wind_dir,phase`` means wind_dir and phase are circular features
++  // desc = per-feature period override syntax: ``circular_feature=name:wind_dir=360,phase=6.283185307179586`` (defaults to ``circular_period`` if omitted)
++  // desc = circular features are split as arcs ``[a, b] mod period`` rather than linear thresholds
++  std::string circular_feature = "";
++
++  // ArcBoost: default period for circular features when not specified per-feature.
++  // desc = default period for circular features (overridable per-feature in ``circular_feature``)
++  // desc = ``2*pi`` (≈ 6.283) for radians, ``360`` for degrees, ``24`` for hour-of-day, ``365.25`` for day-of-year
++  double circular_period = 6.283185307179586;
++
++  // ArcBoost: max number of arc-bins for circular features.
++  // desc = max number of bins for circular features
++  // desc = lower than ``max_bin`` (255) by default since arc-search is O(B^2) and 64 bins gives ~5.6 degree resolution at period 2pi
++  // desc = raise toward 255 for higher angular resolution at the cost of split-find time
++  // check = >1
++  int max_bin_circular = 64;
++
+   // desc = path to a ``.json`` file that specifies bin upper bounds for some or all features
+   // desc = ``.json`` file should contain an array of objects, each containing the word ``feature`` (integer feature index) and ``bin_upper_bound`` (array of thresholds for binning)
+   // desc = see `this file <https://github.com/microsoft/LightGBM/blob/master/examples/regression/forced_bins.json>`__ as an example
